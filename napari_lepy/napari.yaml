@@ -1,0 +1,10 @@
+name: napari-lepy
+display_name: LEPY
+contributions:
+  commands:
+    - id: napari-lepy.widget
+      python_name: napari_lepy._widget:LEPYWidget
+      title: LEPY Pipeline
+  widgets:
+    - command: napari-lepy.widget
+      display_name: LEPY Pipeline

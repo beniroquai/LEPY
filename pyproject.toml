@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-lepy"
+version = "0.1.0"
+description = "Interactive napari plugin for LEPY - Lepidoptera phenotyping pipeline"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.9"
+authors = [
+    { name = "LEPY contributors" },
+]
+keywords = ["napari", "lepy", "lepidoptera", "phenotyping", "moth", "butterfly", "image-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: napari",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    # napari plugin layer
+    "napari[all]>=0.4.18",
+    "magicgui>=0.7",
+    "qtpy",
+
+    # original LEPY dependencies (kept identical where possible)
+    "numpy",
+    "scipy",
+    "scikit-image",
+    "opencv-python-headless",
+    "matplotlib",
+    "PyYAML",
+    "munch",
+    "tqdm",
+    "gitpython",
+
+    # scalebar is the original LEPY calibration package
+    "scalebar~=0.5.2",
+]
+
+[project.optional-dependencies]
+unet = ["backgroundremover==0.2.8"]
+flatbug = []  # install separately: pip install git+https://github.com/darsa-group/flat-bug
+
+[project.entry-points."napari.manifest"]
+napari-lepy = "napari_lepy:napari.yaml"
+
+[tool.setuptools]
+# Ship BOTH the original lepy package AND the napari wrapper.
+packages = ["lepy", "lepy.binarization", "lepy.outputs", "lepy.outputs.writer", "napari_lepy"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+napari_lepy = ["napari.yaml", "*.jpg"]
