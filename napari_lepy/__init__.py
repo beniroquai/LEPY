@@ -15,6 +15,11 @@ adds a thin interactive layer that lets the user:
        the original ``PointsOfInterest.from_keypoints`` constructor.
     5. Export every layer + the original LEPY CSV/JSON outputs.
 
+It also ships a second widget, *LEPY Review & Correction*
+(:mod:`napari_lepy.review`), for the batch workflow: step through a finished
+LepyLoop run, confirm or reject its results, fix the wrong ones in place, and
+hand the corrected subset back to LepyLoop.
+
 The original LEPY API surface (``lepy.Image``, ``lepy.Worker``,
 ``lepy.PointsOfInterest``, ``lepy.OutputWriter``, ``lepy.Plotter``) is
 re-exported here unchanged.

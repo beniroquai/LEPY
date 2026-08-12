@@ -5,6 +5,11 @@ contributions:
     - id: napari-lepy.widget
       python_name: napari_lepy._widget:LEPYWidget
       title: LEPY Pipeline
+    - id: napari-lepy.review
+      python_name: napari_lepy.review._review_widget:LEPYReviewWidget
+      title: LEPY Review & Correction
   widgets:
     - command: napari-lepy.widget
       display_name: LEPY Pipeline
+    - command: napari-lepy.review
+      display_name: LEPY Review & Correction
