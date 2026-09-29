@@ -102,6 +102,29 @@ def read_contour_txt(path: Path, width: int, height: int) -> np.ndarray:
     return np.round(coords).astype(np.int32)
 
 
+#: Class id of hole polygons in a corrected ``contours_txt`` file.  The outer
+#: outline stays the first line (class 0), so readers that only look at the
+#: first line -- including :func:`read_contour_txt` -- are unaffected.
+HOLE_CLASS_ID = 1
+
+
+def read_holes_txt(path: Path, width: int, height: int) -> T.List[np.ndarray]:
+    """Hole polygons (lines with :data:`HOLE_CLASS_ID`) as ``(N, 2) (x, y)``."""
+    holes: T.List[np.ndarray] = []
+    for line in path.read_text().strip().splitlines()[1:]:
+        parts = line.split()
+        if not parts or parts[0] != str(HOLE_CLASS_ID):
+            continue
+        coords = np.asarray(parts[1:], dtype=float)
+        if coords.size < 6 or coords.size % 2:
+            continue
+        coords = coords.reshape(-1, 2)
+        coords[:, 0] *= width
+        coords[:, 1] *= height
+        holes.append(np.round(coords).astype(np.int32))
+    return holes
+
+
 def contour_to_txt(contour_px: np.ndarray, width: int, height: int,
                    class_id: int = 0) -> str:
     """Inverse of :func:`read_contour_txt` -- one line, no trailing newline."""

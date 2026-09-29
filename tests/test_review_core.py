@@ -12,6 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -163,6 +164,62 @@ for key in ("red_median", "green_median", "blue_median", "hue_median",
             "saturation_median", "luminance_median"):
     same = abs(float(col[key]) - float(base[key])) < 0.51
     check(f"colour stats reproduce {key}", same, f"{base[key]} -> {col[key]}")
+
+# ------------------------------------------------------------------- holes
+# Background enclosed by an antenna/leg touching the body twice is cut out.
+square = np.array([[0, 0], [99, 0], [99, 99], [0, 99]], dtype=np.int32)
+hole = np.array([[20, 20], [59, 20], [59, 59], [20, 59]], dtype=np.int32)
+m = rc.rasterize_contour(square, (120, 120), holes=[hole])
+check("hole cut out of rasterised mask", m.sum() == 100 * 100 - 40 * 40, int(m.sum()))
+hs = rc.contour_stats(square, holes=[hole], shape=(120, 120))
+check("contour_area is net of the hole",
+      abs(hs["contour_area"] - (99 * 99 - 40 * 40)) < 1e-6, hs["contour_area"])
+check("hole count / area reported", hs["contour_holes"] == 1
+      and hs["contour_holes_area"] == 1600, (hs["contour_holes"], hs["contour_holes_area"]))
+hs2 = rc.contour_stats(square, holes=[hole, hole], shape=(120, 120))
+check("overlapping holes are not double counted",
+      hs2["contour_area"] == hs["contour_area"], hs2["contour_area"])
+found = rc.holes_from_mask(m)
+check("holes_from_mask round-trips the mask exactly", len(found) == 1
+      and np.array_equal(rc.rasterize_contour(rc.contour_from_mask(m), m.shape,
+                                              found), m), found)
+check("holes_from_mask drops holes below min area",
+      rc.holes_from_mask(m, min_area_px=2000) == [])
+
+from napari_lepy.review.dataset import read_holes_txt
+text = "\n".join([contour_to_txt(contour, 6000, 4000),
+                  contour_to_txt(hole * 20, 6000, 4000, class_id=1)])
+tmp.write_text(text)
+check("outline still read from line 1 with holes present",
+      np.array_equal(read_contour_txt(tmp, 6000, 4000), contour))
+back_holes = read_holes_txt(tmp, 6000, 4000)
+check("holes txt round-trip", len(back_holes) == 1
+      and np.array_equal(back_holes[0], hole * 20), back_holes)
+
+# POI areas shrink by exactly the hole pixels
+hole_px = np.array([[2600, 1800], [2800, 1800], [2800, 2000], [2600, 2000]])
+with_hole = rc.recompute(base, contour_px=contour, poi_rowcol=poi,
+                         shape=(4000, 6000), scale=rec.scale,
+                         mask_changed=True, holes=[hole_px])
+lost = sum(stats[k] - with_hole[k] for k in
+           ("poi_area_body", "poi_area_wing_l", "poi_area_wing_r"))
+cut = int(rc.rasterize_contour(contour, (4000, 6000)).sum()
+          - rc.rasterize_contour(contour, (4000, 6000), [hole_px]).sum())
+check("POI areas drop by the hole", cut > 0
+      and abs(lost - cut / rec.scale ** 2) < 1e-6, (lost, cut))
+
+# auto-detection: an antenna loop encloses background in EcEs-Lep-00125,
+# while EcEs-Lep-00216 (white wing patches, background-coloured) has none
+_in_rect = lambda pt, r: r[0] <= pt[0] < r[0] + r[2] and r[1] <= pt[1] < r[1] + r[3]
+loop = run.record("EcEs-Lep-00125")
+sugg = rc.detect_background_holes(loop.image(), loop.contour_px())
+big = [h for h in sugg if cv2.contourArea(h.reshape(-1, 1, 2)) > 20000]
+check("antenna loop found in EcEs-Lep-00125", any(
+      _in_rect((3250, 1580), cv2.boundingRect(h))
+      for h in big), [cv2.boundingRect(h) for h in big])
+white = run.record("EcEs-Lep-00216")
+check("white wing patches of EcEs-Lep-00216 are not holes",
+      rc.detect_background_holes(white.image(), white.contour_px()) == [])
 
 # ------------------------------------------------------------------ status
 db = ReviewStatusDB(OUT / "review_status.csv", source_run=run.name)

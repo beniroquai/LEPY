@@ -15,7 +15,7 @@ Two kinds of correction are distinguished:
     *contour*, which is unchanged, so nothing else has to be touched.
 
 ``mask / contour changed``
-    ``contour_*`` and -- because the mask selects which pixels enter the
+    ``contour_*`` (area net of any holes) and -- because the mask selects which pixels enter the
     histograms -- every colour statistic changes too.  Recomputing the colour
     block needs the full-resolution image and is therefore opt-in.
 """
@@ -57,14 +57,30 @@ CONTOUR_KEYS: T.List[str] = [
 # ---------------------------------------------------------------------------
 # geometry helpers
 # ---------------------------------------------------------------------------
+Holes = T.Sequence[np.ndarray]
+
+
+def _valid_holes(holes: T.Optional[Holes]) -> T.List[np.ndarray]:
+    return [np.asarray(h, dtype=np.int32).reshape(-1, 2)
+            for h in (holes or []) if h is not None and len(h) >= 3]
+
+
 def rasterize_contour(contour_px: np.ndarray,
-                      shape: T.Tuple[int, int]) -> np.ndarray:
-    """Fill a LEPY contour ``(N, 2) (x, y)`` into a ``uint8`` {0, 1} mask."""
+                      shape: T.Tuple[int, int],
+                      holes: T.Optional[Holes] = None) -> np.ndarray:
+    """Fill a LEPY contour ``(N, 2) (x, y)`` into a ``uint8`` {0, 1} mask.
+
+    *holes* are further ``(x, y)`` polygons that are cut out again, e.g.
+    background enclosed by an antenna or leg that touches the body twice.
+    """
     mask = np.zeros(shape, dtype=np.uint8)
     if contour_px is None or len(contour_px) < 3:
         return mask
     pts = np.asarray(contour_px, dtype=np.int32).reshape(-1, 1, 2)
-    return cv2.drawContours(mask, [pts], 0, 1, -1)
+    mask = cv2.drawContours(mask, [pts], 0, 1, -1)
+    for hole in _valid_holes(holes):
+        mask = cv2.drawContours(mask, [hole.reshape(-1, 1, 2)], 0, 0, -1)
+    return mask
 
 
 def contour_from_mask(mask: np.ndarray) -> np.ndarray:
@@ -78,6 +94,131 @@ def contour_from_mask(mask: np.ndarray) -> np.ndarray:
         return np.zeros((0, 2), dtype=np.int32)
     largest = max(contours, key=cv2.contourArea)
     return largest[:, 0].astype(np.int32)
+
+
+def holes_from_mask(mask: np.ndarray,
+                    min_area_px: float = 0.0) -> T.List[np.ndarray]:
+    """Holes of the largest object in a binary mask, each ``(N, 2) (x, y)``.
+
+    The polygons trace the *background* pixels of each hole, so
+    ``rasterize_contour(outer, shape, holes)`` reproduces the mask exactly
+    instead of eating a one-pixel rim of the animal.  Holes smaller than
+    *min_area_px* (brush speckles) are dropped.
+    """
+    outer = contour_from_mask(mask)
+    if len(outer) < 3:
+        return []
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    enclosed = rasterize_contour(outer, binary.shape) & (1 - binary)
+    contours, _ = cv2.findContours(enclosed, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    return [c[:, 0].astype(np.int32) for c in contours
+            if len(c) >= 3 and cv2.contourArea(c) >= min_area_px]
+
+
+def _odd(n: float) -> int:
+    return max(3, int(round(n)) | 1)
+
+
+def detect_background_holes(rgb: np.ndarray, contour_px: np.ndarray,
+                            holes: T.Optional[Holes] = None,
+                            tolerance: float = 3.0,
+                            min_area_frac: float = 1e-4,
+                            appendage_frac: float = 0.015,
+                            work_px: int = 1500) -> T.List[np.ndarray]:
+    """Suggest holes: background that the outline wrongly encloses.
+
+    Typical case: an antenna or leg touches the body twice and the outline
+    closes around a patch of background.
+
+    1. The background colour is taken from a ring just outside the outline;
+       pixels inside whose Lab distance to it is below ``tolerance`` x the
+       ring's own spread are candidates.
+    2. Pale wing patches can match the background colour, so a candidate is
+       only kept if it is closed off by *thin* structures: after a
+       morphological opening of the animal with a kernel of
+       ``appendage_frac`` x the specimen size (removing antennae and legs) it
+       must be connected to the outside.
+    3. Survivors are traced again at full resolution.
+
+    Steps 1-2 run on a copy downscaled to ``work_px``.  Components smaller
+    than ``min_area_frac`` of the image are dropped.  These are suggestions
+    for the user to check, not ground truth.
+    """
+    shape = rgb.shape[:2]
+    contour_px = np.asarray(contour_px, dtype=np.int32).reshape(-1, 2)
+    if len(contour_px) < 3:
+        return []
+    holes = _valid_holes(holes)
+    area_min = float(min_area_frac) * shape[0] * shape[1]
+
+    # ---- low resolution: colour candidates + "closed off by thin parts" test
+    f = min(1.0, work_px / max(shape))
+    small_shape = (max(1, int(round(shape[0] * f))), max(1, int(round(shape[1] * f))))
+    small = cv2.resize(rgb, small_shape[::-1], interpolation=cv2.INTER_AREA)
+    scaled = lambda c: np.round(c * f).astype(np.int32)  # noqa: E731
+    outer_s = rasterize_contour(scaled(contour_px), small_shape)
+    inside_s = rasterize_contour(scaled(contour_px), small_shape,
+                                 [scaled(h) for h in holes])
+    if not inside_s.any():
+        return []
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    ring_k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_odd(0.01 * max(small_shape)),) * 2)
+    ring = cv2.dilate(outer_s, ring_k, iterations=3) & (
+        1 - cv2.dilate(outer_s, ring_k))
+    if ring.sum() < 50:
+        return []
+    lab_s = cv2.cvtColor(small, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ref = lab_s[ring > 0]
+    median = np.median(ref, axis=0)
+    threshold = max(tolerance * float(np.median(
+        np.linalg.norm(ref - median, axis=1))), 4.0)
+
+    def candidates(lab: np.ndarray, inside: np.ndarray) -> np.ndarray:
+        near = np.linalg.norm(lab - median, axis=2) < threshold
+        cand = (near & (inside > 0)).astype(np.uint8)
+        return cv2.morphologyEx(cand, cv2.MORPH_OPEN, k3)
+
+    # the eroded interior drops slivers between the polygon and the animal edge
+    cand_s = candidates(lab_s, cv2.erode(inside_s, k3, iterations=2))
+    if not cand_s.any():
+        return []
+
+    x, y = contour_px[:, 0], contour_px[:, 1]
+    size = max(x.max() - x.min(), y.max() - y.min()) * f
+    thick = cv2.morphologyEx(
+        inside_s & (1 - cand_s), cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (_odd(appendage_frac * size),) * 2))
+    _, free = cv2.connectedComponents((thick == 0).astype(np.uint8))
+    open_ids = np.unique(free[outer_s == 0])
+
+    n, comps = cv2.connectedComponents(cand_s)
+    keep_s = np.zeros(small_shape, np.uint8)
+    for i in range(1, n):
+        comp = comps == i
+        if comp.sum() < area_min * f * f:
+            continue
+        if np.isin(free[comp], open_ids).mean() > 0.5:
+            keep_s[comp] = 1
+    if not keep_s.any():
+        return []
+
+    # ---- full resolution: re-trace the accepted regions precisely
+    roi = cv2.resize(cv2.dilate(keep_s, k3, iterations=3), shape[::-1],
+                     interpolation=cv2.INTER_NEAREST)
+    x0, y0, w, h = cv2.boundingRect(roi)
+    sub = (slice(y0, y0 + h), slice(x0, x0 + w))
+    lab = cv2.cvtColor(np.ascontiguousarray(rgb[sub]),
+                       cv2.COLOR_RGB2LAB).astype(np.float32)
+    inside = rasterize_contour(contour_px, shape, holes)[sub]
+    cand = candidates(lab, inside) & roi[sub]
+    contours, _ = cv2.findContours(cand, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE,
+                                   offset=(int(x0), int(y0)))
+    return [c[:, 0].astype(np.int32) for c in contours
+            if cv2.contourArea(c) >= area_min]
 
 
 def simplify_contour(contour_px: np.ndarray, epsilon_px: float) -> np.ndarray:
@@ -150,13 +291,14 @@ def rowcol_from_stats(stats: T.Mapping[str, T.Any]) -> T.Optional[np.ndarray]:
 # ---------------------------------------------------------------------------
 def poi_stats(contour_px: np.ndarray, poi_rowcol: np.ndarray,
               shape: T.Tuple[int, int],
-              scale: T.Optional[float] = None) -> T.Dict[str, T.Any]:
+              scale: T.Optional[float] = None,
+              holes: T.Optional[Holes] = None) -> T.Dict[str, T.Any]:
     """Recompute the ``poi_*`` block for hand-placed POIs.
 
     Mirrors :meth:`lepy.Image.pois` exactly: the binary image the POI code sees
-    is the *filled contour*, not the segmentation mask.
+    is the *filled contour*, not the segmentation mask -- minus any *holes*.
     """
-    filled = rasterize_contour(contour_px, shape)
+    filled = rasterize_contour(contour_px, shape, holes)
     if not filled.any():
         raise ValueError("contour is empty -- cannot recompute POI statistics")
 
@@ -205,9 +347,23 @@ def exact_distances(poi_rowcol: np.ndarray,
     return out
 
 
+#: Extra keys (stats_json only) describing the holes cut into the outline.
+HOLE_COUNT_KEY = "contour_holes"
+HOLE_AREA_KEY = "contour_holes_area"
+
+
 def contour_stats(contour_px: np.ndarray,
-                  scale: T.Optional[float] = None) -> T.Dict[str, T.Any]:
-    """Recompute the ``contour_*`` block, matching :func:`lepy.segmentation.segment`."""
+                  scale: T.Optional[float] = None,
+                  holes: T.Optional[Holes] = None,
+                  shape: T.Optional[T.Tuple[int, int]] = None
+                  ) -> T.Dict[str, T.Any]:
+    """Recompute the ``contour_*`` block, matching :func:`lepy.segmentation.segment`.
+
+    With *holes* (and *shape*), ``contour_area`` is the outline's area minus
+    the pixels the holes remove -- measured by rasterising, so overlapping or
+    partly-outside holes are not double counted.  Length and bounding box
+    stay those of the outer outline.
+    """
     contour_px = np.asarray(contour_px).reshape(-1, 2).astype(np.int32)
     if len(contour_px) < 3:
         raise ValueError("contour needs at least three vertices")
@@ -220,6 +376,14 @@ def contour_stats(contour_px: np.ndarray,
         OUTS.contour.ymin: int(np.amin(contour_px[:, 1])),
         OUTS.contour.ymax: int(np.amax(contour_px[:, 1])),
     }
+    holes = _valid_holes(holes)
+    hole_area = 0.0
+    if holes and shape is not None:
+        hole_area = float(rasterize_contour(contour_px, shape).sum()
+                          - rasterize_contour(contour_px, shape, holes).sum())
+        out[OUTS.contour.area] = max(0.0, out[OUTS.contour.area] - hole_area)
+    out[HOLE_COUNT_KEY] = len(holes)
+    out[HOLE_AREA_KEY] = hole_area
     if scale and scale > 0:
         out[OUTS.contour.area_calibrated] = out[OUTS.contour.area] / scale ** 2
         out[OUTS.contour.width_calibrated] = \
@@ -266,7 +430,8 @@ def recompute(base_stats: T.Mapping[str, T.Any], *,
               rgb: T.Optional[np.ndarray] = None,
               uv: T.Optional[np.ndarray] = None,
               color_mask: T.Optional[np.ndarray] = None,
-              recompute_color: bool = False) -> T.Dict[str, T.Any]:
+              recompute_color: bool = False,
+              holes: T.Optional[Holes] = None) -> T.Dict[str, T.Any]:
     """Return a full stats dict with the corrected values merged in.
 
     Parameters
@@ -283,6 +448,9 @@ def recompute(base_stats: T.Mapping[str, T.Any], *,
     recompute_color
         Recompute the colour histograms from *rgb*.  Costs a second or two on
         a 6000x4000 image, so the caller decides.
+    holes
+        Polygons cut out of the outline (background enclosed by antennae or
+        legs).  They reduce the contour / POI areas and the colour mask.
     """
     stats: T.Dict[str, T.Any] = dict(base_stats)
     height, width = shape
@@ -290,16 +458,18 @@ def recompute(base_stats: T.Mapping[str, T.Any], *,
     stats[OUTS.image.height] = int(height)
 
     if mask_changed:
-        stats.update(contour_stats(contour_px, scale=scale))
+        stats.update(contour_stats(contour_px, scale=scale, holes=holes,
+                                   shape=shape))
         if recompute_color and rgb is not None:
             mask = color_mask if color_mask is not None \
-                else rasterize_contour(contour_px, shape)
+                else rasterize_contour(contour_px, shape, holes)
             try:
                 stats.update(color_stats(rgb, mask, uv=uv))
             except Exception:
                 logger.exception("Colour statistics could not be recomputed")
 
-    stats.update(poi_stats(contour_px, poi_rowcol, shape, scale=scale))
+    stats.update(poi_stats(contour_px, poi_rowcol, shape, scale=scale,
+                           holes=holes))
     stats.update(exact_distances(poi_rowcol, scale=scale))
     return stats
 

@@ -218,6 +218,74 @@ check("filtered list shrinks after a verdict", len(w._view_codes) == n_open - 1,
       len(w._view_codes))
 w.cb_filter.setCurrentIndex(0)
 
+# ------------------------------------------------------------------- holes
+# EcEs-Lep-00125: an antenna touches the wing and encloses background.
+from napari_lepy.review import recompute as rc2
+import cv2
+w.sp_batch_size.setValue(100)
+hcode = "EcEs-Lep-00125"
+w._position = w._view_codes.index(hcode)
+w._load_current()
+check("no holes on a fresh LEPY outline", w._current_holes() == [])
+base_area = float(w._current_stats()["contour_area"])
+w._on_find_holes()
+n_found = len(w._current_holes())
+check("background holes suggested", n_found >= 1, n_found)
+check("suggestions mark the outline dirty", w._contour_dirty)
+from napari.utils.colormaps.standardize_color import transform_color
+edges = np.asarray(viewer.layers[w.L_CONTOUR].edge_color)
+check("outline green, holes red",
+      np.allclose(edges[0], transform_color(rw.OUTLINE_EDGE)[0])
+      and np.allclose(edges[1:], transform_color(rw.HOLE_EDGE)[0]), edges)
+w._on_save()
+hstats = w.corrected_stats[hcode]
+check("contour_area shrinks by the holes",
+      hstats["contour_area"] < base_area
+      and abs(base_area - hstats["contour_area"] - hstats["contour_holes_area"]) < 2,
+      (base_area, hstats["contour_area"], hstats["contour_holes_area"]))
+lines = (OUT / "contours_txt" / f"{hcode}.txt").read_text().strip().splitlines()
+check("holes written as class-1 lines",
+      len(lines) == 1 + n_found and all(l.startswith("1 ") for l in lines[1:]),
+      [l[:2] for l in lines])
+from skimage.io import imread as _imread
+saved_mask = _imread(str(OUT / "masks_png" / f"{hcode}.png")) > 0
+check("saved mask has the holes", int(saved_mask.sum()) == int(
+      rc2.rasterize_contour(w._current_contour(), w._shape, w._current_holes()).sum()))
+w._step(1); w._step(-1)
+check("holes reloaded with the corrected outline",
+      len(w._current_holes()) == n_found, len(w._current_holes()))
+check("reloaded holes are not a pending edit", not w._contour_dirty)
+
+# manual hole: the "Cut hole" button arms polygon drawing ...
+w._on_cut_hole()
+check("cut-hole switches to polygon drawing",
+      viewer.layers[w.L_CONTOUR].mode == "add_polygon")
+viewer.layers[w.L_CONTOUR].mode = "pan_zoom"
+# ... and whatever polygon the user draws becomes one more hole
+r0, c0 = 1900, 2600
+viewer.layers[w.L_CONTOUR].add(
+    [np.array([[r0, c0], [r0, c0 + 150], [r0 + 150, c0 + 150], [r0 + 150, c0]])],
+    shape_type="polygon")
+check("drawn polygon counts as a hole", len(w._current_holes()) == n_found + 1)
+check("outline is still the largest polygon",
+      len(w._current_contour()) > 100, len(w._current_contour()))
+
+# brush round trip keeps the holes
+w._on_to_brush()
+bm = np.asarray(viewer.layers[w.L_MASK].data)
+check("brush mask carries the holes", bm[r0 + 75, c0 + 75] == 0)
+bm = bm.copy(); bm[2100:2200, 2200:2300] = 0         # erase another patch
+viewer.layers[w.L_MASK].data = bm
+w._on_from_brush()
+# (holes touching the outline edge turn into notches of the outer outline)
+areas = sorted(int(cv2.contourArea(h.reshape(-1, 1, 2))) for h in w._current_holes())
+check("erased patch and drawn hole survive as holes",
+      any(abs(a - 99 * 99) < 300 for a in areas)
+      and any(abs(a - 150 * 150) < 700 for a in areas), areas)
+w._on_reset_to_lepy()
+check("reset drops the holes", w._current_holes() == [])
+w._drop_layer(w.L_MASK)
+
 # ----------------------------------------------------------- failed record
 w.sp_batch_size.setValue(100)
 w._position = w._view_codes.index("EcEs-Lep-00462")

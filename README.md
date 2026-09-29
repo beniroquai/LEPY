@@ -278,6 +278,13 @@ If `stats_combined.csv` is missing it is rebuilt from `stats_per_run_csv/`.
 3. **Correct** — drag POIs in the `POI` layer, drag outline vertices in the
    `Contour` layer, or rasterise the outline into a brush mask and paint it.
    Any edit flags the specimen as *corrected*.
+   **Holes:** when an antenna or leg touches the animal twice, the outline
+   closes around a patch of background. **Find background holes** suggests
+   such patches (red polygons); **Cut hole** lets you draw one by hand. Every
+   polygon in the `Contour` layer besides the outline is a hole — delete a
+   wrong one with `S` (select) + `Backspace`. Holes are subtracted from
+   `contour_area`, the POI wing/body areas, the colour statistics and the
+   saved mask, and survive the brush round-trip (erased patches become holes).
 4. **Save** (`W`) — recomputes the affected statistics and writes them out.
    Navigating away auto-saves unless you turn that off.
 
@@ -325,7 +332,8 @@ reanalysis_codes.txt       subset whose outline changed
 stats_corrected.csv        TAB separated, corrected rows only
 stats_combined_merged.csv  the full original table, corrected rows swapped in
 stats_json/<code>.json     corrected stats, same shape as LepyLoop's
-contours_txt/<code>.txt    corrected outline, same normalised format
+contours_txt/<code>.txt    corrected outline, same normalised format;
+                           holes follow as extra lines with class id 1
 masks_png/<code>.png       corrected binary mask (only when it changed)
 ```
 

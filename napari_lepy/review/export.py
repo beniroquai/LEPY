@@ -10,7 +10,8 @@ Write corrections back out, mirroring the LepyLoop folder layout.
         stats_corrected.csv         TAB separated, corrected rows only
         stats_combined_merged.csv   full original table, corrected rows swapped in
         stats_json/<code>.json      corrected stats, same shape as LepyLoop's
-        contours_txt/<code>.txt     corrected polygon, same normalised format
+        contours_txt/<code>.txt     corrected polygon, same normalised format;
+                                    holes follow as extra lines, class id 1
         masks_png/<code>.png        corrected binary mask (only if it changed)
 
 Original file names (the specimen code) are kept everywhere, so LepyLoop can
@@ -29,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from napari_lepy.review.dataset import (
-    LepyRun, STATS_DELIMITER, contour_to_txt,
+    LepyRun, STATS_DELIMITER, contour_to_txt, HOLE_CLASS_ID,
 )
 from napari_lepy.review.status import ReviewStatusDB
 
@@ -124,8 +125,11 @@ class CorrectionWriter:
     def write_specimen(self, code: str, stats: T.Mapping[str, T.Any], *,
                        contour_px: T.Optional[np.ndarray] = None,
                        shape: T.Optional[T.Tuple[int, int]] = None,
-                       mask: T.Optional[np.ndarray] = None) -> T.List[Path]:
-        """Write the JSON, contour and (optionally) mask for one specimen."""
+                       mask: T.Optional[np.ndarray] = None,
+                       holes: T.Optional[T.Sequence[np.ndarray]] = None
+                       ) -> T.List[Path]:
+        """Write the JSON, contour (+ holes) and (optionally) mask for one
+        specimen."""
         written: T.List[Path] = []
 
         json_path = self.root / DIR_STATS_JSON / f"{code}.json"
@@ -137,7 +141,11 @@ class CorrectionWriter:
 
         if contour_px is not None and shape is not None and len(contour_px):
             height, width = shape
-            text = contour_to_txt(contour_px, width=width, height=height)
+            lines = [contour_to_txt(contour_px, width=width, height=height)]
+            lines += [contour_to_txt(hole, width=width, height=height,
+                                     class_id=HOLE_CLASS_ID)
+                      for hole in holes or [] if len(hole) >= 3]
+            text = "\n".join(lines)
             contour_path = self.root / DIR_CONTOURS / f"{code}.txt"
             contour_path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(contour_path, lambda fh: fh.write(text + "\n"),

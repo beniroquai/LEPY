@@ -25,6 +25,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from qtpy.QtCore import Qt, QSize
@@ -66,6 +67,12 @@ FILTERS: T.List[T.Tuple[str, T.Optional[T.Callable[["LEPYReviewWidget", str], bo
 KEY_CONFIRM, KEY_FLAG, KEY_SAVE = "V", "N", "W"
 KEY_QC, KEY_RESET, KEY_UNREVIEW = "Q", "G", "U"
 
+#: Contour-layer styling: the outline and the holes cut out of it.
+OUTLINE_EDGE, OUTLINE_FACE = "#00FF88", "#00FF8820"
+HOLE_EDGE, HOLE_FACE = "#FF3355", "#FF335540"
+#: Smallest hole kept, as a fraction of the image area (~50x50 px at 24 MP).
+MIN_HOLE_FRAC = 1e-4
+
 KEY_HELP = (
     f"<b>←/→</b> prev/next &nbsp;·&nbsp; <b>{KEY_CONFIRM}</b> confirm correct "
     f"&nbsp;·&nbsp; <b>{KEY_FLAG}</b> needs correction &nbsp;·&nbsp; "
@@ -103,6 +110,7 @@ class LEPYReviewWidget(QWidget):
         self._record: T.Optional[SpecimenRecord] = None
         self._orig_poi: T.Optional[np.ndarray] = None
         self._orig_contour: T.Optional[np.ndarray] = None
+        self._orig_holes: T.List[np.ndarray] = []
         self._shape: T.Optional[T.Tuple[int, int]] = None
         self._loading = False
         self._poi_dirty = False
@@ -328,7 +336,8 @@ class LEPYReviewWidget(QWidget):
         hint = QLabel(
             "🖱️  Select the <b>POI</b> layer, press <kbd>3</kbd> (select mode) "
             "and drag a point. Select the <b>Contour</b> layer and press "
-            "<kbd>4</kbd> to move outline vertices.")
+            "<kbd>4</kbd> to move outline vertices. Red polygons in the "
+            "Contour layer are <b>holes</b> cut out of the mask.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 10px;")
         v.addWidget(hint)
@@ -371,6 +380,24 @@ class LEPYReviewWidget(QWidget):
             "Start an empty Labels layer and paint the animal with the brush.")
         self.btn_paint.clicked.connect(self._on_paint_mask)
         row.addWidget(self.btn_paint)
+        v.addLayout(row)
+
+        row = QHBoxLayout()
+        self.btn_cut_hole = QPushButton("Cut hole")
+        self.btn_cut_hole.setToolTip(
+            "Draw a polygon around background that the outline wrongly "
+            "encloses (e.g. an antenna or leg touching the body twice). It is "
+            "removed from the mask, the areas and the colour statistics. "
+            "Delete a hole by selecting it (S) and pressing Backspace.")
+        self.btn_cut_hole.clicked.connect(self._on_cut_hole)
+        row.addWidget(self.btn_cut_hole)
+        self.btn_find_holes = QPushButton("Find background holes")
+        self.btn_find_holes.setToolTip(
+            "Suggest holes: regions inside the outline whose colour matches "
+            "the background just outside it. Check the suggestions -- pale "
+            "wing patches can look like background.")
+        self.btn_find_holes.clicked.connect(self._on_find_holes)
+        row.addWidget(self.btn_find_holes)
         v.addLayout(row)
 
         row = QHBoxLayout()
@@ -665,14 +692,15 @@ class LEPYReviewWidget(QWidget):
                 image.shape[:2] if image is not None else None)
             self._shape = shape
 
-            contour = self._contour_for(record)
+            contour, holes = self._contour_for(record)
             poi = self._poi_for(record)
             self._orig_contour = record.contour_px()
+            self._orig_holes = []
             self._orig_poi = record.poi_rowcol()
 
             self._update_image_layer(image)
             self._update_qc_layer(record, shape)
-            self._update_contour_layer(contour)
+            self._update_contour_layer(contour, holes)
             self._update_poi_layer(poi)
             self._drop_layer(self.L_MASK)
             self._apply_triage(self.cb_triage.isChecked())
@@ -686,19 +714,22 @@ class LEPYReviewWidget(QWidget):
         self._update_specimen_info()
         self._show_traits(self._current_stats())
 
-    def _contour_for(self, record: SpecimenRecord) -> np.ndarray:
-        """Corrected outline if one was saved earlier, else the LEPY one."""
+    def _contour_for(self, record: SpecimenRecord
+                     ) -> T.Tuple[np.ndarray, T.List[np.ndarray]]:
+        """Corrected outline and holes if saved earlier, else the LEPY one."""
         if self.writer is not None:
             path = self.writer.corrected_contour_path(record.code)
             shape = record.image_shape()
             if path is not None and shape is not None:
-                from napari_lepy.review.dataset import read_contour_txt
+                from napari_lepy.review.dataset import (
+                    read_contour_txt, read_holes_txt)
                 try:
-                    return read_contour_txt(path, width=shape[1], height=shape[0])
+                    return (read_contour_txt(path, width=shape[1], height=shape[0]),
+                            read_holes_txt(path, width=shape[1], height=shape[0]))
                 except Exception:
                     logger.exception("Could not read corrected contour for %s",
                                      record.code)
-        return record.contour_px()
+        return record.contour_px(), []
 
     def _poi_for(self, record: SpecimenRecord) -> T.Optional[np.ndarray]:
         stats = self.corrected_stats.get(record.code)
@@ -763,24 +794,27 @@ class LEPYReviewWidget(QWidget):
                                   scale=scale, translate=translate,
                                   visible=self.cb_triage.isChecked())
 
-    def _update_contour_layer(self, contour: np.ndarray) -> None:
+    def _update_contour_layer(self, contour: np.ndarray,
+                              holes: T.Optional[T.Sequence[np.ndarray]] = None
+                              ) -> None:
+        """Outline first, then every hole as its own (red) polygon."""
         if contour is None or len(contour) < 3:
             self._drop_layer(self.L_CONTOUR)
             return
-        polygon = rc.contour_to_polygon(contour)
+        holes = [h for h in holes or [] if len(h) >= 3]
+        polygons = [rc.contour_to_polygon(c) for c in [contour, *holes]]
         width = self._line_width()
-        if self.L_CONTOUR in self.viewer.layers:
-            layer = self.viewer.layers[self.L_CONTOUR]
-            layer.data = [polygon]
-            layer.shape_type = "polygon"
-            layer.edge_width = width
-        else:
+        if self.L_CONTOUR not in self.viewer.layers:
             layer = self.viewer.add_shapes(
-                [polygon], shape_type="polygon", name=self.L_CONTOUR,
-                edge_color="#00FF88", face_color="#00FF8820",
-                edge_width=width, opacity=0.9)
+                name=self.L_CONTOUR, edge_width=width, opacity=0.9)
             layer.events.data.connect(self._on_contour_edited)
         layer = self.viewer.layers[self.L_CONTOUR]
+        layer.data = []
+        layer.add(polygons, shape_type="polygon", edge_width=width,
+                  edge_color=[OUTLINE_EDGE] + [HOLE_EDGE] * len(holes),
+                  face_color=[OUTLINE_FACE] + [HOLE_FACE] * len(holes))
+        layer.current_edge_color = OUTLINE_EDGE
+        layer.current_face_color = OUTLINE_FACE
         layer.visible = not self.cb_triage.isChecked()
 
     def _update_poi_layer(self, poi: T.Optional[np.ndarray]) -> None:
@@ -987,14 +1021,24 @@ class LEPYReviewWidget(QWidget):
         data = np.asarray(self.viewer.layers[self.L_POI].data, dtype=float)
         return data if data.shape == (len(pal.POI_NAMES), 2) else data
 
-    def _current_contour(self) -> np.ndarray:
+    def _current_polygons(self) -> T.List[np.ndarray]:
+        """Contour-layer polygons as ``(x, y)`` contours, largest area first."""
         if self.L_CONTOUR not in self.viewer.layers:
-            return np.zeros((0, 2), dtype=np.int32)
-        shapes = self.viewer.layers[self.L_CONTOUR].data
-        if not len(shapes):
-            return np.zeros((0, 2), dtype=np.int32)
-        largest = max(shapes, key=len)
-        return rc.polygon_to_contour(largest)
+            return []
+        contours = [rc.polygon_to_contour(p)
+                    for p in self.viewer.layers[self.L_CONTOUR].data]
+        contours = [c for c in contours if len(c) >= 3]
+        return sorted(contours, key=lambda c: -abs(cv2.contourArea(
+            c.reshape(-1, 1, 2).astype(np.float32))))
+
+    def _current_contour(self) -> np.ndarray:
+        """The outer outline: the largest polygon of the Contour layer."""
+        polygons = self._current_polygons()
+        return polygons[0] if polygons else np.zeros((0, 2), dtype=np.int32)
+
+    def _current_holes(self) -> T.List[np.ndarray]:
+        """Every further polygon of the Contour layer is a hole."""
+        return self._current_polygons()[1:]
 
     def _on_simplify(self) -> None:
         contour = self._current_contour()
@@ -1003,7 +1047,7 @@ class LEPYReviewWidget(QWidget):
         reduced = rc.simplify_contour(contour, float(self.sp_epsilon.value()))
         self._loading = True
         try:
-            self._update_contour_layer(reduced)
+            self._update_contour_layer(reduced, self._current_holes())
         finally:
             self._loading = False
         self._contour_dirty = True
@@ -1048,7 +1092,7 @@ class LEPYReviewWidget(QWidget):
         contour = self._current_contour()
         if self._shape is None or len(contour) < 3:
             return
-        mask = rc.rasterize_contour(contour, self._shape)
+        mask = rc.rasterize_contour(contour, self._shape, self._current_holes())
         if self.L_MASK in self.viewer.layers:
             self.viewer.layers[self.L_MASK].data = mask
         else:
@@ -1073,15 +1117,64 @@ class LEPYReviewWidget(QWidget):
         if len(contour) < 3:
             self._warn("Empty mask", "The brush mask contains no object.")
             return
+        # Erased patches inside the animal become holes; brush speckles don't.
+        holes = rc.holes_from_mask(
+            mask, min_area_px=MIN_HOLE_FRAC * mask.shape[0] * mask.shape[1])
         self._loading = True
         try:
-            self._update_contour_layer(contour)
+            self._update_contour_layer(contour, holes)
         finally:
             self._loading = False
         self.viewer.layers[self.L_CONTOUR].visible = not self.cb_triage.isChecked()
         self._contour_dirty = True
         self.lbl_notice.setText(
-            f"Outline rebuilt from the brush mask ({len(contour)} vertices).")
+            f"Outline rebuilt from the brush mask ({len(contour)} vertices, "
+            f"{len(holes)} hole{'' if len(holes) == 1 else 's'}).")
+        self._update_specimen_info()
+
+    def _on_cut_hole(self) -> None:
+        """Switch the Contour layer to polygon drawing for a new hole."""
+        if self.L_CONTOUR not in self.viewer.layers:
+            self.lbl_notice.setText("No outline — draw or paint one first.")
+            return
+        layer = self.viewer.layers[self.L_CONTOUR]
+        layer.visible = True
+        layer.current_edge_color = HOLE_EDGE
+        layer.current_face_color = HOLE_FACE
+        layer.mode = "add_polygon"
+        self.viewer.layers.selection.active = layer
+        self.lbl_notice.setText(
+            "Click around the background patch, press <Escape> to finish. "
+            "Every polygon besides the outline is cut out of the mask.")
+
+    def _on_find_holes(self) -> None:
+        record = self._record
+        contour = self._current_contour()
+        if record is None or len(contour) < 3:
+            return
+        image = record.image()
+        if image is None:
+            self.lbl_notice.setText("No image — cannot look for holes.")
+            return
+        holes = self._current_holes()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            found = rc.detect_background_holes(
+                image, contour, holes, min_area_frac=MIN_HOLE_FRAC)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not found:
+            self.lbl_notice.setText("No background enclosed by the outline found.")
+            return
+        self._loading = True
+        try:
+            self._update_contour_layer(contour, holes + found)
+        finally:
+            self._loading = False
+        self._contour_dirty = True
+        self.lbl_notice.setText(
+            f"{len(found)} hole{'' if len(found) == 1 else 's'} suggested (red). "
+            "Delete wrong ones: select with S, then Backspace.")
         self._update_specimen_info()
 
     def _on_redetect_poi(self) -> None:
@@ -1089,7 +1182,7 @@ class LEPYReviewWidget(QWidget):
         if self._shape is None or len(contour) < 3:
             return
         from lepy.poi import PointsOfInterest
-        filled = rc.rasterize_contour(contour, self._shape)
+        filled = rc.rasterize_contour(contour, self._shape, self._current_holes())
         try:
             pois = PointsOfInterest.detect(filled)
         except Exception as exc:
@@ -1113,7 +1206,7 @@ class LEPYReviewWidget(QWidget):
             return
         self._loading = True
         try:
-            self._update_contour_layer(self._record.contour_px())
+            self._update_contour_layer(self._record.contour_px(), [])
             self._update_poi_layer(self._record.poi_rowcol())
             self._drop_layer(self.L_MASK)
         finally:
@@ -1147,8 +1240,12 @@ class LEPYReviewWidget(QWidget):
             self._warn("No outline", "The contour layer holds no usable polygon.")
             return
 
-        mask_changed = self._contour_dirty or not _same_contour(
-            contour, self._orig_contour)
+        holes = self._current_holes()
+        mask_changed = (self._contour_dirty
+                        or not _same_contour(contour, self._orig_contour)
+                        or len(holes) != len(self._orig_holes)
+                        or not all(_same_contour(a, b)
+                                   for a, b in zip(holes, self._orig_holes)))
         moved, max_shift = rc.poi_shift(self._orig_poi, poi)
         poi_changed = self._poi_dirty or moved > 0
 
@@ -1173,14 +1270,15 @@ class LEPYReviewWidget(QWidget):
                 scale=record.scale, mask_changed=mask_changed,
                 rgb=record.image() if mask_changed else None,
                 color_mask=brush_mask,
-                recompute_color=self.cb_recolor.isChecked())
+                recompute_color=self.cb_recolor.isChecked(),
+                holes=holes)
             mask = None
             if mask_changed:
                 mask = brush_mask if brush_mask is not None \
-                    else rc.rasterize_contour(contour, self._shape)
+                    else rc.rasterize_contour(contour, self._shape, holes)
             self.writer.write_specimen(record.code, stats,
                                        contour_px=contour, shape=self._shape,
-                                       mask=mask)
+                                       mask=mask, holes=holes)
             self.corrected_stats[record.code] = stats
             # Flags accumulate: a later POI-only save must not clear the fact
             # that the outline was edited in an earlier one.
@@ -1203,6 +1301,7 @@ class LEPYReviewWidget(QWidget):
 
         self._poi_dirty = self._contour_dirty = False
         self._orig_poi, self._orig_contour = poi.copy(), contour.copy()
+        self._orig_holes = [h.copy() for h in holes]
         self._show_traits(stats)
         self._rebuild_list()
         self._update_counts()
@@ -1213,6 +1312,8 @@ class LEPYReviewWidget(QWidget):
                 what.append(f"{moved} POI moved (max {max_shift:.0f} px)")
             if mask_changed:
                 what.append("outline changed → flagged for re-analysis")
+                if holes:
+                    what.append(f"{len(holes)} hole(s) cut out")
             self.lbl_notice.setText("Saved: " + ", ".join(what))
 
     # =====================================================================
@@ -1256,7 +1357,8 @@ class LEPYReviewWidget(QWidget):
         editable = record.image_path is not None
         for button in (self.btn_save, self.btn_simplify, self.btn_to_brush,
                        self.btn_from_brush, self.btn_redetect, self.btn_reset,
-                       self.btn_draw, self.btn_paint):
+                       self.btn_draw, self.btn_paint, self.btn_cut_hole,
+                       self.btn_find_holes):
             button.setEnabled(editable)
 
         # Look the row up by code -- ``_position`` may already point at the next
@@ -1396,7 +1498,8 @@ class LEPYReviewWidget(QWidget):
                        self.btn_skip, self.btn_unreview, self.btn_save,
                        self.btn_simplify, self.btn_to_brush, self.btn_from_brush,
                        self.btn_reset, self.btn_redetect, self.btn_qc_full,
-                       self.btn_draw, self.btn_paint):
+                       self.btn_draw, self.btn_paint, self.btn_cut_hole,
+                       self.btn_find_holes):
             widget.setEnabled(enabled)
 
     def _warn(self, title: str, message: str) -> None:
