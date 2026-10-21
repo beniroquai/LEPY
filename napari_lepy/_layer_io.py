@@ -7,33 +7,23 @@ from numpy arrays where napari needs them.
 """
 from __future__ import annotations
 
-import typing as T
 import numpy as np
 
 from lepy.outputs import OUTPUTS as OUTS
 from lepy.poi import PointsOfInterest, Point
 
+# Single source of truth for POI order and appearance -- shared with the
+# review widget so both views colour the same point the same way.
+from napari_lepy.review.palette import (
+    POI_NAMES, POI_COLORS, POI_LABELS, POI_SHORT,
+)
 
-# Order in which POIs are stored in the napari Points layer.
-# Identical to PointsOfInterest.__iter__ (excluding `center`).
-POI_NAMES: T.List[str] = [
-    "body_top", "body_bot",
-    "outer_l", "outer_r",
-    "inner_top_l", "inner_top_r",
-    "inner_bot_l", "inner_bot_r",
+__all__ = [
+    # re-exported from napari_lepy.review.palette for backwards compatibility
+    "POI_NAMES", "POI_COLORS", "POI_LABELS", "POI_SHORT",
+    "pois_to_array", "array_to_keypoints", "labels_to_mask",
+    "contour_to_polygon", "recompute_contour",
 ]
-
-# Per-POI colour for the napari Points layer (matches LEPY's pipeline diagram).
-POI_COLORS = {
-    "body_top":    "cyan",
-    "body_bot":    "cyan",
-    "outer_l":     "magenta",
-    "outer_r":     "magenta",
-    "inner_top_l": "yellow",
-    "inner_top_r": "yellow",
-    "inner_bot_l": "orange",
-    "inner_bot_r": "orange",
-}
 
 
 def pois_to_array(pois: PointsOfInterest) -> np.ndarray:

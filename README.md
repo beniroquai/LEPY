@@ -18,8 +18,16 @@ front-end that lets you:
 - **export everything**: every layer as TIFF, plus the original LEPY
   CSV / JSON outputs and the standard LEPY visual-summary PNG.
 
+There are **two widgets**:
+
+| Widget | Use it for |
+|--------|-----------|
+| **LEPY Pipeline** | one image at a time, from raw photo to exported traits |
+| **LEPY Review & Correction** | quality-controlling a finished [LepyLoop][lepyloop] batch of 1 000–1 500 images, and fixing the ones that went wrong |
+
 [napari]: https://napari.org
 [lepy]: https://github.com/Jena-CompPhylo-Lab/LEPY
+[lepyloop]: https://github.com/DesBoe/LepyLoop
 
 ---
 
@@ -228,6 +236,177 @@ LEPY will detect that `key_points` are available and call
 
 ---
 
+## Batch review & correction
+
+The **LEPY Review & Correction** widget is for the other direction: LepyLoop has
+already run over 1 000–1 500 images unattended, and you now need to check its
+output and repair the failures — without leaving napari and without re-running
+the whole batch.
+
+```bash
+napari
+# Plugins menu → "LEPY Review & Correction"
+```
+
+### What it reads
+
+Point it at a LepyLoop execution folder (`…_Lepy_Execution_<date>`) — or at the
+input folder, in which case the newest execution sibling is picked up
+automatically. Everything else is discovered from it:
+
+| File | Used for |
+|------|----------|
+| `stats_combined.csv` (TAB separated) | POI pixel coordinates + all traits |
+| `stats_json/<code>.json` | typed stats (preferred over the CSV) |
+| `contours_txt/<code>.txt` | outline, YOLO-seg format normalised to `[0, 1]` |
+| `visualisations_png/<code>.png` | the QC figure shown for a fast verdict |
+| `jpgs/<code>.jpg` | the full-resolution image to edit on |
+| `morphological_errors*` | pre-flags implausible specimens |
+| `errors_log/*.log` | reason a specimen has no result at all |
+
+If `stats_combined.csv` is missing it is rebuilt from `stats_per_run_csv/`.
+
+### The loop
+
+1. **Batch** — set a batch size (default 100) and step through with `◀ ▶`.
+   The **Show** dropdown filters to *Not reviewed*, *Needs correction*,
+   *Morphology-flagged*, *LEPY failed*, …
+2. **Judge** — `V` confirms the LEPY values, `N` flags the specimen. `Q`
+   swaps the canvas between the editable overlay and the pre-rendered QC
+   figure. The QC figure is scaled into the specimen's extent, so toggling
+   never moves the camera.
+3. **Correct** — drag POIs in the `POI` layer, drag outline vertices in the
+   `Contour` layer, or rasterise the outline into a brush mask and paint it.
+   Any edit flags the specimen as *corrected*.
+   **Holes:** when an antenna or leg touches the animal twice, the outline
+   closes around a patch of background. **Find background holes** suggests
+   such patches (red polygons); **Cut hole** lets you draw one by hand. Every
+   polygon in the `Contour` layer besides the outline is a hole — delete a
+   wrong one with `S` (select) + `Backspace`. Holes are subtracted from
+   `contour_area`, the POI wing/body areas, the colour statistics and the
+   saved mask, and survive the brush round-trip (erased patches become holes).
+4. **Save** (`W`) — recomputes the affected statistics and writes them out.
+   Navigating away auto-saves unless you turn that off.
+
+Keyboard: `←`/`→` prev/next · `V` correct · `N` needs fix · `W` save ·
+`Q` QC figure · `G` reset to LEPY · `U` un-review.
+
+> These letters look arbitrary, and that is deliberate: napari consults the
+> **active layer's** keymap before the viewer's, and the Image layer already
+> binds `O` and `X`, Shapes binds `T`/`X`, Labels binds `X`. `G H J K N Q U V W`
+> are the letters no napari layer claims. See the comment above `KEY_CONFIRM`
+> in `napari_lepy/review/_review_widget.py` before changing them.
+
+### POI colour coding
+
+Marker **symbol** encodes the anatomical role, **hue** the individual point.
+The pairs that overlap in practice (`inner_top_l`/`inner_top_r`,
+`inner_bot_l`/`inner_bot_r`) get maximally contrasting hues, so they stay
+distinguishable even when drawn on top of each other:
+
+| POI | Colour | Symbol |
+|-----|--------|--------|
+| `body_top` | `#EE7733` orange | ▲ |
+| `body_bot` | `#CC3311` red | ▼ |
+| `outer_l` | `#0077BB` blue | ● |
+| `outer_r` | `#33BBEE` cyan | ● |
+| `inner_top_l` | `#009988` teal | ■ |
+| `inner_top_r` | `#EE3377` magenta | ■ |
+| `inner_bot_l` | `#BBBB00` olive | ◆ |
+| `inner_bot_r` | `#AA4499` purple | ◆ |
+
+Paul Tol's *vibrant/bright* set — safe for deuteranopia, protanopia and
+tritanopia. Two alternatives (`Hue = role, symbol = side` after Okabe-Ito, and
+a flat 8-hue set) are selectable in the widget; see
+`napari_lepy/review/palette.py` to add your own.
+
+### What it writes
+
+A sibling folder `…_Napari_Corrections_<date>/`, mirroring the LepyLoop layout
+and keeping the original file names:
+
+```
+review_status.csv          one row per specimen — the review database
+corrected_codes.txt        one code per line → hand this to LepyLoop
+reanalysis_codes.txt       subset whose outline changed
+stats_corrected.csv        TAB separated, corrected rows only
+stats_combined_merged.csv  the full original table, corrected rows swapped in
+stats_json/<code>.json     corrected stats, same shape as LepyLoop's
+contours_txt/<code>.txt    corrected outline, same normalised format;
+                           holes follow as extra lines with class id 1
+masks_png/<code>.png       corrected binary mask (only when it changed)
+```
+
+`review_status.csv` columns:
+
+| Column | Meaning |
+|--------|---------|
+| `status` | `unreviewed` · `ok` · `corrected` · `flagged` · `skipped` · `failed` |
+| `poi_corrected` / `mask_corrected` | which tool was used |
+| `n_poi_moved`, `max_poi_shift_px` | how large the correction was |
+| `needs_reanalysis` | **the one LepyLoop cares about** — `True` when the outline changed, so colour statistics have to be recomputed from the full-resolution image |
+| `reviewer`, `reviewed_at`, `batch`, `note`, `source_run` | provenance |
+
+It is rewritten atomically on every verdict, so an interrupted session loses
+nothing.
+
+### Handing back to LepyLoop
+
+```python
+codes = open("…_Napari_Corrections_…/reanalysis_codes.txt").read().split()
+```
+
+A POI-only correction needs **no** re-run: those traits are already recomputed
+here through the original `PointsOfInterest.from_keypoints` /
+`.distances()` / `.areas()` code, and land in `stats_corrected.csv`. Only
+`needs_reanalysis` specimens have to go through segmentation again.
+
+### Checking it against your own data
+
+Both suites are plain scripts — no pytest, no fixtures. Point them at a folder
+containing a LepyLoop input directory and its execution sibling:
+
+```bash
+python tests/test_review_core.py ~/Downloads/Lepy_data
+```
+
+```bash
+python tests/test_review_gui.py ~/Downloads/Lepy_data
+```
+
+The core suite verifies, among other things, that re-deriving the statistics
+for an *unedited* specimen reproduces LepyLoop's own numbers bit for bit —
+every `poi_dist_*`, `poi_area_*`, `contour_*` and colour entry. That is the
+guarantee that a corrected row is comparable to an uncorrected one.
+
+`python tests/shot.py ~/Downloads/Lepy_data` opens a real napari window and
+writes screenshots.
+
+### Known upstream quirk: POI distances are quantised
+
+`lepy.poi.Point.__post_init__` casts coordinates to `int`, and
+`PointsOfInterest.distances()` divides by the calibration *before* measuring.
+POI coordinates are therefore truncated to **whole millimetres** before the
+Euclidean distance is taken. On this dataset (166 px/mm) that means:
+
+- reported left FWL `6.40 mm` where the true distance is `6.68 mm`,
+- moving a POI by up to ~1 mm changes the reported trait by **exactly zero**.
+
+The widget does not silently change this — `poi_dist_*` stays bit-identical to
+what LepyLoop produces. Instead it writes four extra keys into
+`stats_json/<code>.json`:
+
+```
+poi_dist_inner_exact, poi_dist_body_exact,
+poi_dist_inner_outer_l_exact, poi_dist_inner_outer_r_exact
+```
+
+measured in pixels and converted afterwards, and shows both side by side in the
+trait panel (`LEPY` / `exact`). Fixing it upstream is a one-line change in
+`Point.rescale`, but it would shift every previously published number.
+
+---
+
 ## Layers reference
 
 | Layer name | napari type | What it is | Editable? |
@@ -328,9 +507,20 @@ napari-lepy/
 ├── napari_lepy/              ← the plugin
 │   ├── __init__.py
 │   ├── napari.yaml
-│   ├── _widget.py            ← the dock widget
+│   ├── _widget.py            ← "LEPY Pipeline" dock widget (single image)
 │   ├── _layer_io.py          ← bridge helpers (POI ↔ array, mask ↔ Labels)
+│   ├── review/               ← "LEPY Review & Correction" (batch QC)
+│   │   ├── _review_widget.py ← the dock widget
+│   │   ├── dataset.py        ← indexes a LepyLoop execution folder
+│   │   ├── status.py         ← review_status.csv database
+│   │   ├── recompute.py      ← re-derives stats through the original lepy code
+│   │   ├── export.py         ← writes corrections in the LepyLoop layout
+│   │   └── palette.py        ← the POI colour / symbol schemes
 │   └── scalebar_template.jpg ← bundled for one-click calibration
+├── tests/
+│   ├── test_review_core.py   ← headless: dataset, recompute, status, export
+│   ├── test_review_gui.py    ← drives a real (hidden) napari viewer
+│   └── shot.py               ← renders screenshots of the review widget
 ├── examples/
 │   ├── example.jpg
 │   └── uv_red.jpg
@@ -364,6 +554,26 @@ dependencies. All function signatures and behaviour are unchanged.
   resolution image with a visible black-and-white square ruler.
 - **`unet` method fails to import** — install `backgroundremover` as
   described above.
+
+### Review widget
+
+- **"No specimen matches this filter"** — the current batch has nothing left in
+  the selected state. Switch **Show** back to *All specimens*, or step to the
+  next batch.
+- **Outline vertices are sluggish to drag** — a LEPY contour has >2 000
+  vertices. Press **Simplify outline** (default ε = 6 px) first; that reduces it
+  to a few hundred. This counts as a correction, since it does change the
+  stored outline.
+- **"Wrong number of POIs"** — a point was added or deleted in the `POI` layer.
+  All eight must be present, in the original order. Press **Reset to LEPY** or
+  **Re-detect POI from outline**.
+- **A corrected specimen re-opens with the LEPY values** — check that the
+  output folder is the same one as in the earlier session; corrections are
+  reloaded from `<output>/stats_json/`.
+- **Saving is slow** — recomputing colour statistics on a 6000×4000 image takes
+  a second or two. It only happens when the outline changed; untick
+  *Recompute colour statistics* if you would rather leave that to the LepyLoop
+  re-run.
 
 ---
 
